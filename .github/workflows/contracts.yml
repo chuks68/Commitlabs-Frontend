@@ -38,7 +38,7 @@ jobs:
 
       - name: Run Cargo Tests
         working-directory: contracts
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build Soroban Smart Contracts
         working-directory: contracts

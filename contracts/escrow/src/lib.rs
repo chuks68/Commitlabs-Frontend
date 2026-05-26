@@ -106,6 +106,33 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+        /// Set a new admin address. Only callable by current admin after initialization.
+        /// Emits an event on success.
+        pub fn set_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+            Self::require_init(&env)?;
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::Admin, &new_admin);
+            env.events().publish(
+                (Symbol::new(&env, "set_admin"), admin.clone()),
+                (new_admin.clone(),),
+            );
+            Ok(())
+        }
+
+        /// Set a new fee recipient address. Only callable by current admin after initialization.
+        /// Emits an event on success.
+        pub fn set_fee_recipient(env: Env, new_fee_recipient: Address) -> Result<(), Error> {
+            Self::require_init(&env)?;
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+            admin.require_auth();
+            env.storage().instance().set(&DataKey::FeeRecipient, &new_fee_recipient);
+            env.events().publish(
+                (Symbol::new(&env, "set_fee_recipient"), admin.clone()),
+                (new_fee_recipient.clone(),),
+            );
+            Ok(())
+        }
     /// One-time initialization. Sets the admin, the escrow token and the fee
     /// recipient. Must be called before any commitment is created.
     pub fn initialize(

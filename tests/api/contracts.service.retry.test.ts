@@ -13,12 +13,10 @@
  * timers are used and every test is deterministic.
  */
 
-process.on("unhandledRejection", (e) => console.error("UNHANDLED:", e));
+
 import { describe, it, expect, vi } from "vitest";
 
-import * as contractsMod from "@/lib/backend/services/contracts";
-console.log("CONTRACTS MODULE KEYS:", Object.keys(contractsMod));
-console.log("retryWithBackoff:", typeof contractsMod.retryWithBackoff);
+
 
 // The contracts service imports cache / counters / config / logger at module
 // load. None of that is exercised by these unit tests, so the modules are

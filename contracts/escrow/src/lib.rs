@@ -457,6 +457,9 @@ impl EscrowContract {
             return Err(Error::NotMatured);
         }
 
+<<<<<<< feature/reentrancy-safe-transfers
+        // Effects: Update state before interactions to prevent reentrancy
+=======
         let yield_pool = Self::yield_pool_balance(&env);
         if yield_pool < c.accrued_yield {
             return Err(Error::InsufficientYieldPool);
@@ -468,8 +471,13 @@ impl EscrowContract {
         token.transfer(&contract, &c.owner, &total_payout);
 
         Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
+>>>>>>> master
         c.status = EscrowStatus::Released;
         Self::save(&env, &c);
+
+        // Interactions: External token transfers
+        let token = Self::token_client(&env);
+        token.transfer(&env.current_contract_address(), &c.owner, &c.amount);
 
         env.events().publish(
             (Symbol::new(&env, "release"), c.owner.clone()),
@@ -489,6 +497,37 @@ impl EscrowContract {
         Ok(refund_amount)
     }
 
+<<<<<<< feature/reentrancy-safe-transfers
+        if c.status != EscrowStatus::Funded {
+            return Err(Error::InvalidState);
+        }
+
+        let penalty = (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128;
+        let refund_amount = c.amount - penalty;
+
+        // Effects: Update state before interactions to prevent reentrancy
+        c.status = EscrowStatus::Refunded;
+        Self::save(&env, &c);
+
+        // Interactions: External token transfers
+        let token = Self::token_client(&env);
+        let contract = env.current_contract_address();
+        if penalty > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .ok_or(Error::NotInitialized)?;
+            token.transfer(&contract, &fee_recipient, &penalty);
+        }
+        token.transfer(&contract, &c.owner, &refund_amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "refund"), c.owner.clone()),
+            (commitment_id, refund_amount, penalty),
+        );
+        Ok(refund_amount)
+=======
     /// Process an early exit for a commitment. Only the owner (caller) may early exit
     /// and only while the commitment is `Funded`. Returns the structured result including
     /// exit amount, penalty amount, and updated status.
@@ -509,6 +548,7 @@ impl EscrowContract {
             penaltyAmount: penalty_amount,
             finalStatus: EscrowStatus::Refunded,
         })
+>>>>>>> master
     }
 
     /// Flag a funded commitment as disputed, freezing release/refund until an
@@ -577,10 +617,15 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        let token = Self::token_client(&env);
-        let contract = env.current_contract_address();
         let paid;
+        let penalty;
+
         if release_to_owner {
+<<<<<<< feature/reentrancy-safe-transfers
+            c.status = EscrowStatus::Released;
+            paid = c.amount;
+            penalty = 0;
+=======
             let mut payout = c.amount;
             if env.ledger().timestamp() >= c.maturity {
                 let yield_pool = Self::yield_pool_balance(&env);
@@ -593,13 +638,29 @@ impl EscrowContract {
             token.transfer(&contract, &c.owner, &payout);
             c.status = EscrowStatus::Released;
             paid = payout;
+>>>>>>> master
         } else {
-            let penalty = (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128;
-            paid = c.amount - penalty;
-            token.transfer(&contract, &c.owner, &paid);
             c.status = EscrowStatus::Refunded;
+            penalty = (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128;
+            paid = c.amount - penalty;
         }
+
+        // Effects: Update state before interactions to prevent reentrancy
         Self::save(&env, &c);
+
+        // Interactions: External token transfers
+        let token = Self::token_client(&env);
+        let contract = env.current_contract_address();
+
+        if penalty > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .ok_or(Error::NotInitialized)?;
+            token.transfer(&contract, &fee_recipient, &penalty);
+        }
+        token.transfer(&contract, &c.owner, &paid);
 
         env.events().publish(
             (Symbol::new(&env, "resolve_dispute"), admin),

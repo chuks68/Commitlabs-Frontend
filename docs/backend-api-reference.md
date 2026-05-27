@@ -141,10 +141,11 @@ curl -X POST http://localhost:3000/api/commitments \
 
 ## `POST /api/commitments/[id]/settle`
 
-Marks the commitment identified by `id` as settled.  Currently a stub that emits
-`CommitmentSettled` events.
+Marks the commitment identified by `id` as settled.  Currently a stub that emits `CommitmentSettled` events.
 
 - **Path parameter**: `id` (string)
+- **Headers**:
+    - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Replayed requests within the 24-hour replay window return the original prior result.
 - **Request body**: optional JSON payload with additional details.
 - **Response**: stub confirmation message.
 
@@ -167,10 +168,11 @@ curl -X POST http://localhost:3000/api/commitments/abc123/settle \
 
 ## `POST /api/commitments/[id]/early-exit`
 
-Triggers an early exit (with penalty) for the named commitment.  Emits
-`CommitmentEarlyExit` events.
+Triggers an early exit (with penalty) for the named commitment.  Emits `CommitmentEarlyExit` events.
 
 - **Path parameter**: `id` (string)
+- **Headers**:
+    - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Replayed requests within the 24-hour replay window return the original prior result.
 - **Request body**: optional JSON with penalty or reason.
 - **Response**: stub message.
 
@@ -187,6 +189,57 @@ curl -X POST http://localhost:3000/api/commitments/abc123/early-exit \
   "message": "Stub early-exit endpoint for commitment abc123",
   "commitmentId": "abc123"
 }
+```
+
+---
+
+## `GET /api/attestations/recent`
+
+Returns the most recent attestations sorted by `observedAt` descending, with
+page-based pagination metadata.
+
+- **Query parameters**:
+    - `page`: (integer, optional) Page number (1-based). Must be ≥ 1. Defaults to 1.
+    - `pageSize`: (integer, optional) Items per page. Must be 1–100. Defaults to 10.
+    - `ownerAddress`: (string, optional) Filter by commitment owner address. Requires a valid `Authorization: Bearer <token>` header.
+- **Response**: `200 OK` with attestation list and pagination meta.
+- **Error codes**:
+    - `400 VALIDATION_ERROR` — `page` or `pageSize` out of range, or `ownerAddress` is blank.
+    - `401 UNAUTHORIZED` — `ownerAddress` provided without a valid Bearer token.
+    - `429 TOO_MANY_REQUESTS` — Rate limit exceeded.
+
+### Example
+
+```bash
+curl 'http://localhost:3000/api/attestations/recent?page=1&pageSize=2'
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "attestations": [
+      { "id": "ATT-005", "commitmentId": "CMT-005", "observedAt": "2026-04-24T10:00:00Z" },
+      { "id": "ATT-004", "commitmentId": "CMT-004", "observedAt": "2026-04-23T10:00:00Z" }
+    ],
+    "total": 5
+  },
+  "meta": {
+    "page": 1,
+    "pageSize": 2,
+    "total": 5,
+    "totalPages": 3,
+    "hasNextPage": true,
+    "hasPrevPage": false
+  }
+}
+```
+
+Filtered by owner (requires authentication):
+
+```bash
+curl 'http://localhost:3000/api/attestations/recent?ownerAddress=GAAA...WHF' \
+     -H 'Authorization: Bearer <token>'
 ```
 
 ---
@@ -212,6 +265,67 @@ curl -X POST http://localhost:3000/api/attestations \
 {
   "message": "Attestations recording endpoint stub - rate limiting applied",
   "ip": "::1"
+}
+```
+
+---
+
+## `GET /api/notifications`
+
+Returns the authenticated owner's derived notification feed. Notifications are
+derived on-read from the owner's commitments and attestations (expiry warnings,
+violations, attestation health checks); they are not persisted.
+
+The feed is filtered by the owner's **notification delivery preferences**. Each
+notification has a `type` (`expiry`, `violation`, `health_check`), and only
+types the owner has opted into are returned. Preferences are read from stored
+user preferences (the `notificationCategories` field) and updated via the
+`PUT /api/user/preferences` endpoint.
+
+- **Query parameters**:
+    - `ownerAddress`: (string, required) The Stellar address whose feed to return.
+    - `page`: (number, optional, default `1`) 1-indexed page number. Must be `>= 1`.
+    - `pageSize`: (number, optional, default `10`) Items per page. Must be `1`–`100`.
+- **Preference filtering**:
+    - Notification categories the owner has set to `false` in
+      `notificationCategories` are excluded from the feed.
+    - When no preferences are stored, or a category key is absent, the category
+      is **delivered by default** (safe opt-in). An owner only stops receiving a
+      category by explicitly opting out.
+    - Filtering is applied **before pagination**, so `total` reflects the count
+      of notifications the owner can actually see — not the raw derived count.
+- **Response**:
+    - `200 OK`: Paginated, preference-filtered feed.
+    - `400 Bad Request`: `ownerAddress` is missing, or pagination params are out of range.
+    - `429 Too Many Requests`: Rate limit exceeded.
+
+### Example
+
+```bash
+curl 'http://localhost:3000/api/notifications?ownerAddress=0x123&page=1&pageSize=10'
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "ownerAddress": "0x123",
+        "title": "Commitment Nearing Expiry",
+        "message": "Your commitment CMT-1 for XLM expires in 5 days.",
+        "severity": "warning",
+        "type": "expiry",
+        "read": false,
+        "createdAt": "2026-02-25T00:00:00.000Z",
+        "relatedCommitmentId": "CMT-1"
+      }
+    ],
+    "page": 1,
+    "pageSize": 10,
+    "total": 1
+  }
 }
 ```
 

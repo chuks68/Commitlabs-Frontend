@@ -16,7 +16,7 @@
 //! `fund_escrow`, `release`, `refund`, and `dispute`.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 /// Storage keys for persistent contract state.
@@ -422,6 +422,16 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
+        // Validate that the commitment's asset matches the configured escrow token.
+        let configured_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        if c.asset != configured_token {
+            return Err(Error::AssetMismatch);
+        }
+
         let token = Self::token_client(&env);
         token.transfer(&c.owner, &env.current_contract_address(), &c.amount);
 
@@ -464,15 +474,26 @@ impl EscrowContract {
     }
 
     /// Release the escrowed funds back to the owner once the commitment has
-    /// matured. Only callable on a `Funded` commitment at/after maturity.
-    pub fn release(env: Env, commitment_id: u64, caller: Address) -> Result<i128, Error> {
+    /// matured.
+    ///
+    /// Authorization rationale:
+    /// - Post-maturity this call is permissionless: any actor (including a
+    ///   third party) may invoke `release` to move funds out of the contract.
+    /// - This design avoids liveness issues where the owner cannot trigger
+    ///   release (e.g. lost key) while still protecting funds against
+    ///   diversion. To prevent an invoker from capturing funds, the transfer
+    ///   ALWAYS targets the stored `owner` recorded on the `Commitment`.
+    ///   The invoker never receives the escrowed asset.
+    pub fn release(env: Env, commitment_id: u64) -> Result<i128, Error> {
         Self::require_init(&env)?;
-        caller.require_auth();
         let mut c = Self::load(&env, commitment_id)?;
 
         if c.status != EscrowStatus::Funded {
             return Err(Error::InvalidState);
         }
+        // Enforce maturity: release is only allowed once the duration has
+        // elapsed. If the ledger timestamp is still before maturity we return
+        // the explicit `NotMatured` error so callers can handle that case.
         if env.ledger().timestamp() < c.maturity {
             return Err(Error::NotMatured);
         }
@@ -490,6 +511,10 @@ impl EscrowContract {
         Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
         c.status = EscrowStatus::Released;
         Self::save(&env, &c);
+
+        // Interactions: External token transfers
+        let token = Self::token_client(&env);
+        token.transfer(&env.current_contract_address(), &c.owner, &c.amount);
 
         env.events().publish(
             (Symbol::new(&env, "release"), c.owner.clone()),
@@ -597,9 +622,9 @@ impl EscrowContract {
             return Err(Error::InvalidState);
         }
 
-        let token = Self::token_client(&env);
-        let contract = env.current_contract_address();
         let paid;
+        let penalty;
+
         if release_to_owner {
             let mut payout = c.amount;
             if env.ledger().timestamp() >= c.maturity {
@@ -614,22 +639,86 @@ impl EscrowContract {
             c.status = EscrowStatus::Released;
             paid = payout;
         } else {
-            let penalty = if Self::is_within_grace_period(&env, &c) {
-                0
-            } else {
-                (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128
-            };
-            paid = c.amount - penalty;
-            token.transfer(&contract, &c.owner, &paid);
             c.status = EscrowStatus::Refunded;
+            penalty = (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128;
+            paid = c.amount - penalty;
         }
+
+        // Effects: Update state before interactions to prevent reentrancy
         Self::save(&env, &c);
+
+        // Interactions: External token transfers
+        let token = Self::token_client(&env);
+        let contract = env.current_contract_address();
+
+        if penalty > 0 {
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .ok_or(Error::NotInitialized)?;
+            token.transfer(&contract, &fee_recipient, &penalty);
+        }
+        token.transfer(&contract, &c.owner, &paid);
 
         env.events().publish(
             (Symbol::new(&env, "resolve_dispute"), admin),
             (commitment_id, release_to_owner, paid),
         );
         Ok(paid)
+    }
+
+    /// Upgrade the escrow contract to a new WASM implementation.
+    ///
+    /// Only the configured admin may perform contract upgrades. This uses the
+    /// stored `DataKey::Admin` authorization principal and then updates the
+    /// current contract WASM through the deployer. The new wasm hash must be a
+    /// valid 32-byte contract hash and cannot be the zero hash.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        // Ensure the contract has been initialized and admin is present.
+        Self::require_init(&env)?;
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+
+        // Admin must sign the upgrade transaction.
+        // Authorization model:
+        // - The admin address is stored in contract instance storage under
+        //   `DataKey::Admin` and is the single authority allowed to perform
+        //   upgrades.
+        // - We read the admin from storage at runtime (not hardcoded), then
+        //   require the admin to sign the transaction with `require_auth()`.
+        // - `require_auth()` enforces that the calling transaction is
+        //   authorized by the admin signature. If the admin key does not
+        //   authorize the transaction, execution stops here and no upgrade
+        //   will be performed.
+        // - This keeps the upgrade surface minimal: only a signed admin
+        //   invocation can reach `update_current_contract_wasm`.
+        admin.require_auth();
+
+        // Prevent a zero-hash upgrade which is not a valid deployed contract.
+        // Rejecting the zero hash avoids accidentally setting the contract's
+        // implementation to an invalid/empty WASM.
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if new_wasm_hash == zero_hash {
+            return Err(Error::InvalidWasmHash);
+        }
+
+        // Perform the upgrade via the deployer. This is the critical action
+        // that swaps the current contract implementation to the provided
+        // `new_wasm_hash`. Because we've already enforced `admin.require_auth()`
+        // above, this call is safe under the contract's upgrade authorization
+        // model: only an admin-signed transaction can reach this point.
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        // Emit an event that an upgrade occurred. Observers can verify the
+        // new wasm hash and audit who performed the upgrade.
+        env.events().publish((Symbol::new(&env, "upgrade"), admin), new_wasm_hash);
+
+        Ok(())
     }
 
     /// Record a compliance attestation (0..=100) against a commitment. Mirrors
@@ -643,7 +732,7 @@ impl EscrowContract {
         Self::require_init(&env)?;
         attestor.require_auth();
         let mut c = Self::load(&env, commitment_id)?;
-        let score = if compliance_score > 100 { 100 } else { compliance_score };
+        let score = compliance_score.min(100);
         c.compliance_score = score;
         Self::save(&env, &c);
 

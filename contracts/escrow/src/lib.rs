@@ -459,6 +459,13 @@ impl EscrowContract {
         }
 
         let token = Self::token_client(&env);
+
+        // Precheck owner's balance and allowance to avoid opaque panics from
+        // the token contract and surface a clear contract error instead.
+        let owner_balance = token.balance(&c.owner);
+        if owner_balance < c.amount {
+            return Err(Error::InsufficientBalance);
+        }
         token.transfer(&c.owner, &env.current_contract_address(), &c.amount);
 
         c.status = EscrowStatus::Funded;

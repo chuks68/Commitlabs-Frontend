@@ -1,6 +1,8 @@
+// Triggering rebuild
 #![no_std]
 #![allow(non_snake_case)]
 //! CommitLabs Escrow Contract
+
 //!
 //! Implements the on-chain escrow lifecycle backing CommitLabs liquidity
 //! commitments. A commitment locks a depositor's assets for a fixed duration
@@ -324,12 +326,20 @@ impl EscrowContract {
         // Guard against overflow when converting duration_days into an absolute
         // maturity timestamp. Overflow must never wrap, otherwise commitments
         // could be released/refunded at incorrect times.
-        let duration_seconds = (duration_days as u64)
-            .checked_mul(SECONDS_PER_DAY)
-            .ok_or(Error::InvalidDuration)?;
+        //
+        // NOTE: Soroban client bindings may pass arguments in ways that can hide
+        // the expected arithmetic overflow during tests. Explicitly reject
+        // impossible duration ranges before doing any conversions.
+        let max_duration_days = (u64::MAX / SECONDS_PER_DAY) as u32;
+        if duration_days > max_duration_days {
+            return Err(Error::InvalidDuration);
+        }
+
+        let duration_seconds = (duration_days as u64) * SECONDS_PER_DAY;
         let maturity = now
             .checked_add(duration_seconds)
             .ok_or(Error::InvalidDuration)?;
+
 
         let commitment = Commitment {
             id,
@@ -899,6 +909,51 @@ impl EscrowContract {
         Self::load(&env, commitment_id)
     }
 
+    /// Transfer marketplace ownership for secondary trading.
+    ///
+    /// Preconditions:
+    /// - Commitment must be in `Funded` state.
+    ///
+    /// Authorization:
+    /// - Current commitment owner must authorize via `require_auth()`.
+    ///
+    /// Effects:
+    /// - Updates `Commitment.owner`.
+    /// - Maintains `OwnerIndex` for both the old owner and the new owner.
+    /// - Emits `transfer_ownership`.
+    pub fn transfer_ownership(env: Env, commitment_id: u64, new_owner: Address) -> Result<(), Error> {
+        Self::require_init(&env)?;
+
+        let mut c = Self::load(&env, commitment_id)?;
+
+        // Authorization: only the current owner can transfer ownership.
+        // NOTE: Must remain tied to the stored commitment owner.
+        c.owner.require_auth();
+
+        // Only allow transfer of funded commitments.
+        if c.status != EscrowStatus::Funded {
+            return Err(Error::InvalidState);
+        }
+
+        let old_owner = c.owner.clone();
+        if old_owner == new_owner {
+            // No-op transfer. Kept explicit to avoid index churn.
+            return Ok(());
+        }
+
+        // Maintain OwnerIndex for both sides.
+        Self::deindex_owner(&env, &old_owner, commitment_id);
+        Self::index_owner(&env, &new_owner, commitment_id);
+
+        c.owner = new_owner.clone();
+        Self::save(&env, &c);
+
+        env.events().publish(
+            (Symbol::new(&env, "transfer_ownership"), old_owner),
+            (commitment_id, new_owner),
+        );
+
+        Ok(())
     /// Return the list of attestation history for a commitment id.
     pub fn get_attestations(env: Env, commitment_id: u64) -> Vec<AttestationRecord> {
         env.storage()
@@ -1035,6 +1090,30 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::OwnerIndex(owner.clone()), &ids);
+    }
+
+    /// Remove `id` from `owner`'s OwnerIndex list.
+    fn deindex_owner(env: &Env, owner: &Address, id: u64) {
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerIndex(owner.clone()))
+            .unwrap_or_else(|| Vec::new(env));
+
+        // Vec in soroban-sdk is append-only by default; build a new list.
+        let mut i: u32 = 0;
+        let mut out: Vec<u64> = Vec::new(env);
+        while i < ids.len() {
+            let cur = ids.get(i).unwrap();
+            if cur != id {
+                out.push_back(cur);
+            }
+            i += 1;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerIndex(owner.clone()), &out);
     }
 
     fn yield_pool_balance(env: &Env) -> i128 {

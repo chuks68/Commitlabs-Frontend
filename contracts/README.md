@@ -50,6 +50,20 @@ create_commitment ──► fund_escrow ──► release            (matured: p
                                   └──► dispute ──► resolve_dispute   (admin adjudication)
 ```
 
+### Marketplace transfer flow (secondary trading)
+
+`transfer_ownership(commitment_id, new_owner)` updates ownership for a **funded** commitment.
+
+**Flow**
+1. Marketplace buyer proposes `new_owner`.
+2. The current commitment owner calls `transfer_ownership` and must authorize via `require_auth()`.
+3. The contract verifies the commitment is `Funded` (transfers are blocked for non-funded states).
+4. The contract updates:
+   - `Commitment.owner`
+   - `OwnerIndex` for both `old_owner` and `new_owner`
+5. The commitment is now eligible for subsequent `release` / `refund` / dispute handling under the new owner.
+
+
 ### Public functions
 
 | Function | Description |
@@ -58,6 +72,11 @@ create_commitment ──► fund_escrow ──► release            (matured: p
 | `create_commitment(owner, asset, amount, risk, duration_days, penalty_bps)` | Create an unfunded commitment with explicit penalty; returns its `id`. |
 | `create_commitment_with_default_penalty(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
 | `fund_escrow(commitment_id)` | Transfer `amount` from owner into the contract (`Created → Funded`). |
+| `transfer_ownership(commitment_id, new_owner)` | Transfer marketplace ownership for secondary trading (`Funded` only). Current owner must authorize and the contract updates both `Commitment.owner` and `OwnerIndex`. |
+| `release(commitment_id, caller)` | Return principal to owner once matured (`Funded → Released`). |
+| `refund(commitment_id)` | Early-exit refund of principal minus `penalty_bps` (`Funded → Refunded`). |
+| `dispute(commitment_id, caller, reason)` | Freeze a funded commitment pending admin resolution. |
+
 | `deposit_yield_pool(admin, amount)` | Admin-only deposit of yield tokens into the contract yield pool. |
 | `get_yield_pool_balance()` | Read the yield pool balance available for matured release payouts. |
 | `release(commitment_id, caller)` | Return principal plus accrued yield to owner once matured (`Funded → Released`). |

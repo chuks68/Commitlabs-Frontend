@@ -35,6 +35,12 @@ pub enum DataKey {
     OwnerIndex(Address),
     /// Protocol fee recipient.
     FeeRecipient,
+    /// Yield pool balance used to pay matured release yield.
+    YieldPool,
+    /// Contract pause flag to halt write operations.
+    Paused,
+    /// Attestation history for a commitment.
+    Attestations(u64),
     /// Dispute record for a commitment, keyed by commitment id.
     Dispute(u64),
     /// Default penalty in basis points for each RiskProfile.
@@ -134,8 +140,10 @@ pub enum Error {
     NotMatured = 7,
     InvalidDuration = 8,
     PenaltyTooHigh = 9,
+    /// Insufficient funds in the yield pool to satisfy a matured release.
+    InsufficientYieldPool = 10,
     /// Contract is currently paused for emergency halt.
-    Paused = 10,
+    Paused = 11,
 }
 
 /// Result of an early exit commitment.
@@ -146,6 +154,23 @@ pub struct EarlyExitResult {
     pub exitAmount: i128,
     pub penaltyAmount: i128,
     pub finalStatus: EscrowStatus,
+}
+
+/// Result of a matured settlement invoked by `settle_commitment`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(non_snake_case)]
+pub struct SettlementResult {
+    pub settlementAmount: i128,
+    pub finalStatus: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AttestationRecord {
+    pub attestor: Address,
+    pub compliance_score: u32,
+    pub timestamp: u64,
 }
 
 const MAX_PENALTY_BPS: u32 = 10_000;
@@ -309,6 +334,7 @@ impl EscrowContract {
             owner: owner.clone(),
             asset,
             amount,
+            accrued_yield: calculate_accrued_yield(amount, duration_days, risk),
             risk,
             status: EscrowStatus::Created,
             maturity,
@@ -338,7 +364,7 @@ impl EscrowContract {
     ///
     /// `duration_days` is converted to an absolute maturity timestamp using the
     /// current ledger time.
-    pub fn create_commitment_with_default_penalty(
+    pub fn create_commitment_default(
         env: Env,
         owner: Address,
         asset: Address,
@@ -347,6 +373,7 @@ impl EscrowContract {
         duration_days: u32,
     ) -> Result<u64, Error> {
         Self::require_init(&env)?;
+        Self::require_not_paused(&env)?;
         owner.require_auth();
 
         if amount <= 0 {
@@ -361,7 +388,10 @@ impl EscrowContract {
 
         let id = Self::next_id(&env);
         let now = env.ledger().timestamp();
-        let maturity = now + (duration_days as u64) * SECONDS_PER_DAY;
+        let duration_seconds = (duration_days as u64)
+            .checked_mul(SECONDS_PER_DAY)
+            .ok_or(Error::InvalidDuration)?;
+        let maturity = now.checked_add(duration_seconds).ok_or(Error::InvalidDuration)?;
 
         let accrued_yield = calculate_accrued_yield(amount, duration_days, risk);
         let commitment = Commitment {
@@ -443,12 +473,9 @@ impl EscrowContract {
         Self::yield_pool_balance(&env)
     }
 
-    /// Release the escrowed funds back to the owner once the commitment has
-    /// matured. Only callable on a `Funded` commitment at/after maturity.
-    pub fn release(env: Env, commitment_id: u64, caller: Address) -> Result<i128, Error> {
-        Self::require_init(&env)?;
+    fn perform_release(env: &Env, commitment_id: u64, caller: &Address) -> Result<i128, Error> {
         caller.require_auth();
-        let mut c = Self::load(&env, commitment_id)?;
+        let mut c = Self::load(env, commitment_id)?;
 
         if c.status != EscrowStatus::Funded {
             return Err(Error::InvalidState);
@@ -457,25 +484,48 @@ impl EscrowContract {
             return Err(Error::NotMatured);
         }
 
-        let yield_pool = Self::yield_pool_balance(&env);
+        let yield_pool = Self::yield_pool_balance(env);
         if yield_pool < c.accrued_yield {
             return Err(Error::InsufficientYieldPool);
         }
 
         let total_payout = c.amount + c.accrued_yield;
-        let token = Self::token_client(&env);
+        let token = Self::token_client(env);
         let contract = env.current_contract_address();
         token.transfer(&contract, &c.owner, &total_payout);
 
-        Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
+        Self::set_yield_pool_balance(env, yield_pool - c.accrued_yield);
         c.status = EscrowStatus::Released;
-        Self::save(&env, &c);
+        Self::save(env, &c);
 
         env.events().publish(
-            (Symbol::new(&env, "release"), c.owner.clone()),
+            (Symbol::new(env, "release"), c.owner.clone()),
             (commitment_id, total_payout, c.accrued_yield),
         );
         Ok(total_payout)
+    }
+
+    /// Release the escrowed funds back to the owner once the commitment has
+    /// matured. Only callable on a `Funded` commitment at/after maturity.
+    pub fn release(env: Env, commitment_id: u64, caller: Address) -> Result<i128, Error> {
+        Self::require_init(&env)?;
+        Self::perform_release(&env, commitment_id, &caller)
+    }
+
+    /// Alias matching the backend settlement method name.
+    /// Delegates to matured release logic and returns a structured settlement
+    /// result the backend can parse.
+    pub fn settle_commitment(
+        env: Env,
+        commitment_id: u64,
+        caller: Address,
+    ) -> Result<SettlementResult, Error> {
+        Self::require_init(&env)?;
+        let payout = Self::perform_release(&env, commitment_id, &caller)?;
+        Ok(SettlementResult {
+            settlementAmount: payout,
+            finalStatus: String::from_str(&env, "SETTLED"),
+        })
     }
 
     /// Early-exit refund. Returns the principal minus the early-exit penalty;
@@ -677,7 +727,7 @@ impl EscrowContract {
 
     /// Retrieve the default penalty (in basis points) for a specific risk profile.
     /// Configured at initialization time and used by
-    /// `create_commitment_with_default_penalty()`. Useful for querying the
+    /// `create_commitment_default()`. Useful for querying the
     /// current penalty configuration.
     pub fn get_default_penalty(env: Env, risk: RiskProfile) -> Result<u32, Error> {
         env.storage()
@@ -754,7 +804,7 @@ impl EscrowContract {
         id
     }
 
-    fn is_paused(env: &Env) -> bool {
+    fn is_paused_internal(env: &Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -762,7 +812,7 @@ impl EscrowContract {
     }
 
     fn require_not_paused(env: &Env) -> Result<(), Error> {
-        if Self::is_paused(env) {
+        if Self::is_paused_internal(env) {
             return Err(Error::Paused);
         }
         Ok(())

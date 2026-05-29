@@ -47,11 +47,12 @@ create_commitment ──► fund_escrow ──► release            (matured: p
 | --- | --- |
 | `initialize(admin, token, fee_recipient, safe_default_penalty_bps, balanced_default_penalty_bps, aggressive_default_penalty_bps)` | One-time setup of admin, escrow token (SAC), fee recipient, and default penalties for each risk profile. |
 | `create_commitment(owner, asset, amount, risk, duration_days, penalty_bps)` | Create an unfunded commitment with explicit penalty; returns its `id`. |
-| `create_commitment_with_default_penalty(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
+| `create_commitment_default(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
 | `fund_escrow(commitment_id)` | Transfer `amount` from owner into the contract (`Created → Funded`). |
 | `deposit_yield_pool(admin, amount)` | Admin-only deposit of yield tokens into the contract yield pool. |
 | `get_yield_pool_balance()` | Read the yield pool balance available for matured release payouts. |
 | `release(commitment_id, caller)` | Return principal plus accrued yield to owner once matured (`Funded → Released`). |
+| `settle_commitment(commitment_id, caller)` | Alias for `release` that returns a settlement result matching backend ABI expectations. |
 | `refund(commitment_id)` | Early-exit refund of principal minus `penalty_bps` (`Funded → Refunded`). |
 | `dispute(commitment_id, caller, reason)` | Freeze a funded commitment pending admin resolution. The reason is automatically categorized. |
 | `resolve_dispute(commitment_id, release_to_owner)` | Admin-only settlement of a disputed commitment. |
@@ -125,7 +126,7 @@ recipient on `refund` / adverse `resolve_dispute`.
 ### Default penalties per risk profile
 
 Default penalties are configured once at initialization and automatically applied
-to commitments created via `create_commitment_with_default_penalty()`. This
+to commitments created via `create_commitment_default()`. This
 simplifies commitment creation when consistent penalty tiers are desired.
 
 #### Backend-aligned defaults
@@ -147,7 +148,7 @@ The contract provides two ways to create commitments:
    - Overrides default if needed
    - Useful for custom deal terms
 
-2. **Default penalty** (`create_commitment_with_default_penalty`): Use the profile default
+2. **Default penalty** (`create_commitment_default`): Use the profile default
    - Simplifies API calls
    - Ensures consistency across commitments
    - No penalty parameter needed
@@ -155,7 +156,7 @@ The contract provides two ways to create commitments:
 Example:
 ```rust
 // Use default penalty (e.g., 3% for Balanced risk)
-let id = contract.create_commitment_with_default_penalty(
+let id = contract.create_commitment_default(
     &owner, &asset, &1000, &RiskProfile::Balanced, &30
 )?;
 

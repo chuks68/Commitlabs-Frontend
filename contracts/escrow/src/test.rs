@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 #[test]
 fn admin_can_rotate_admin_and_fee_recipient() {
     let f = setup();
@@ -34,7 +36,6 @@ fn unauthorized_cannot_rotate_admin_or_fee_recipient() {
     let res2 = f.client.try_set_fee_recipient(&new_fee);
     assert_eq!(res2, Err(Ok(Error::Unauthorized)));
 }
-#![cfg(test)]
 
 use super::*;
 use soroban_sdk::{
@@ -154,6 +155,44 @@ fn release_after_maturity_pays_principal_plus_yield() {
     assert_eq!(f.token.balance(&f.admin), 0);
     assert_eq!(f.client.get_yield_pool_balance(), 9);
     assert_eq!(commitment.status, EscrowStatus::Released);
+}
+
+#[test]
+fn settle_commitment_alias_matches_release_and_returns_settlement_result() {
+    let f = setup();
+    let owner = Address::generate(&f.env);
+    fund_owner(&f, &owner, 1_000);
+    let id = f
+        .client
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200);
+    f.client.fund_escrow(&id);
+
+    let admin_deposit = 10;
+    f.token_admin.mint(&f.admin, &admin_deposit);
+    f.client.deposit_yield_pool(&f.admin, &admin_deposit);
+
+    // Advance ledger time past maturity.
+    f.env.ledger().set_timestamp(11 * 86_400);
+    let result = f.client.settle_commitment(&id, &owner);
+
+    assert_eq!(result.settlementAmount, 1_001);
+    assert_eq!(result.finalStatus, String::from_str(&f.env, "SETTLED"));
+    assert_eq!(f.token.balance(&owner), 1_001);
+    assert_eq!(f.client.get_commitment(&id).status, EscrowStatus::Released);
+}
+
+#[test]
+fn settle_commitment_before_maturity_fails() {
+    let f = setup();
+    let owner = Address::generate(&f.env);
+    fund_owner(&f, &owner, 1_000);
+    let id = f
+        .client
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200);
+    f.client.fund_escrow(&id);
+
+    let res = f.client.try_settle_commitment(&id, &owner);
+    assert_eq!(res, Err(Ok(Error::NotMatured)));
 }
 
 #[test]
@@ -587,13 +626,13 @@ fn get_default_penalty_returns_configured_values() {
 }
 
 #[test]
-fn create_commitment_with_default_penalty_safe() {
+fn create_commitment_default_safe() {
     let f = setup();
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
 
     // Create with default penalty for Safe profile (2%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -607,13 +646,13 @@ fn create_commitment_with_default_penalty_safe() {
 }
 
 #[test]
-fn create_commitment_with_default_penalty_balanced() {
+fn create_commitment_default_balanced() {
     let f = setup();
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
 
     // Create with default penalty for Balanced profile (3%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -627,13 +666,13 @@ fn create_commitment_with_default_penalty_balanced() {
 }
 
 #[test]
-fn create_commitment_with_default_penalty_aggressive() {
+fn create_commitment_default_aggressive() {
     let f = setup();
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
 
     // Create with default penalty for Aggressive profile (5%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -675,7 +714,7 @@ fn refund_with_default_penalty_safe_applies_correct_fee() {
     fund_owner(&f, &owner, 1_000);
 
     // Create commitment with Safe default penalty (2%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -697,7 +736,7 @@ fn refund_with_default_penalty_balanced_applies_correct_fee() {
     fund_owner(&f, &owner, 1_000);
 
     // Create commitment with Balanced default penalty (3%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -719,7 +758,7 @@ fn refund_with_default_penalty_aggressive_applies_correct_fee() {
     fund_owner(&f, &owner, 1_000);
 
     // Create commitment with Aggressive default penalty (5%).
-    let id = f.client.create_commitment_with_default_penalty(
+    let id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -741,7 +780,7 @@ fn multiple_commitments_different_profiles_use_correct_defaults() {
     fund_owner(&f, &owner, 10_000);
 
     // Create three commitments with different risk profiles.
-    let safe_id = f.client.create_commitment_with_default_penalty(
+    let safe_id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -749,7 +788,7 @@ fn multiple_commitments_different_profiles_use_correct_defaults() {
         &30,
     );
     
-    let balanced_id = f.client.create_commitment_with_default_penalty(
+    let balanced_id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -757,7 +796,7 @@ fn multiple_commitments_different_profiles_use_correct_defaults() {
         &30,
     );
     
-    let aggressive_id = f.client.create_commitment_with_default_penalty(
+    let aggressive_id = f.client.create_commitment_default(
         &owner,
         &f.asset,
         &1_000,
@@ -780,7 +819,7 @@ fn create_commitment_with_default_validates_amount() {
     let owner = Address::generate(&f.env);
     
     // Attempt to create with invalid amount.
-    let res = f.client.try_create_commitment_with_default_penalty(
+    let res = f.client.try_create_commitment_default(
         &owner,
         &f.asset,
         &0, // Invalid: amount must be > 0
@@ -797,7 +836,7 @@ fn create_commitment_with_default_validates_duration() {
     fund_owner(&f, &owner, 1_000);
     
     // Attempt to create with invalid duration.
-    let res = f.client.try_create_commitment_with_default_penalty(
+    let res = f.client.try_create_commitment_default(
         &owner,
         &f.asset,
         &1_000,

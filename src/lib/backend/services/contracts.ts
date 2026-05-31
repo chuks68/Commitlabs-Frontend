@@ -55,6 +55,7 @@ export interface ChainCommitment {
   violationCount: number;
   createdAt?: string;
   expiresAt?: string;
+  contractVersion?: string;
 }
 
 export interface CreateCommitmentOnChainResult {
@@ -126,7 +127,6 @@ export interface ResolveDisputeOnChainResult {
   resolvedAt: string;
 }
 
-type ContractCallMode = 'read' | 'write';
 export interface EarlyExitCommitmentOnChainParams {
   commitmentId: string;
   callerAddress?: string;
@@ -164,6 +164,46 @@ function getRpcUrl(): string {
 
 function getNetworkPassphrase(): string {
   return getBackendConfig().networkPassphrase;
+}
+
+function getRpcTimeoutMs(): number {
+  const raw = Number(process.env.SOROBAN_RPC_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+}
+
+async function withRpcTimeout<T>(
+  promise: Promise<T>,
+  methodName: string,
+): Promise<T> {
+  const timeoutMs = getRpcTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new BackendError({
+              code: "GATEWAY_TIMEOUT",
+              message:
+                "The blockchain operation timed out. It may still be processed later.",
+              status: 504,
+              details: {
+                methodName,
+                timeoutMs,
+                retryable: true,
+              },
+            }),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function getContractId(kind: "commitmentCore" | "attestationEngine"): string {
@@ -515,6 +555,7 @@ function parseChainCommitment(value: unknown): ChainCommitment {
     violationCount: asNumber(raw.violationCount ?? raw.violation_count),
     createdAt: asString(raw.createdAt ?? raw.created_at) || undefined,
     expiresAt: asString(raw.expiresAt ?? raw.expires_at) || undefined,
+    contractVersion: (getBackendConfig() as { activeVersion?: string }).activeVersion,
   };
 }
 
@@ -656,7 +697,10 @@ async function invokeContractMethod(
   const contract = new Contract(contractId);
   const account =
     mode === "write"
-      ? await server.getAccount(sourcePublicKey)
+      ? await withRpcTimeout(
+          server.getAccount(sourcePublicKey),
+          `${methodName}.getAccount`,
+        )
       : new Account(sourcePublicKey, "0");
   const operation = contract.call(
     methodName,
@@ -671,7 +715,10 @@ async function invokeContractMethod(
     .setTimeout(30)
     .build();
 
-  const simulation = await server.simulateTransaction(tx);
+  const simulation = await withRpcTimeout(
+    server.simulateTransaction(tx),
+    `${methodName}.simulateTransaction`,
+  );
   if (SorobanRpc.Api.isSimulationError(simulation)) {
     throw normalizeContractError(new Error(simulation.error), {
       code: "BLOCKCHAIN_CALL_FAILED",
@@ -697,7 +744,10 @@ async function invokeContractMethod(
     });
   }
 
-  const preparedTx = await server.prepareTransaction(tx);
+  const preparedTx = await withRpcTimeout(
+    server.prepareTransaction(tx),
+    `${methodName}.prepareTransaction`,
+  );
   preparedTx.sign(sourceKeypair);
   const sendResult = await server.sendTransaction(preparedTx);
   const txHash = sendResult.hash;
@@ -730,7 +780,12 @@ async function invokeReadContractMethod(
       invokeContractMethod(contractId, methodName, params, "read", attempt),
     {
       ...READ_RETRY_CONFIG,
-      isRetryable: isRetryableContractError,
+      isRetryable: (error) =>
+        !(
+          error instanceof BackendError &&
+          error.code === "GATEWAY_TIMEOUT" &&
+          asRecord(error.details).timeoutMs !== undefined
+        ) && isRetryableContractError(error),
       onRetry: ({ attempt, delayMs, error }) => {
         logInfo(undefined, "[soroban] retrying read after transient failure", {
           methodName,
@@ -1172,16 +1227,11 @@ export async function fundEscrowOnChain(
 export async function openDisputeOnChain(
   params: DisputeOnChainParams,
 ): Promise<DisputeOnChainResult> {
-export async function earlyExitCommitmentOnChain(
-  params: EarlyExitCommitmentOnChainParams,
-  loggingContext?: LoggingContext,
-): Promise<EarlyExitCommitmentOnChainResult> {
   try {
     if (!params.commitmentId) {
       throw new BackendError({
         code: "BAD_REQUEST",
         message: "Missing commitment id for dispute.",
-        message: "Missing commitment id for early exit.",
         status: 400,
       });
     }
@@ -1192,13 +1242,6 @@ export async function earlyExitCommitmentOnChain(
       throw new BackendError({
         code: "CONFLICT",
         message: "Cannot dispute a commitment that is already settled or exited.",
-    const commitment = await getCommitmentFromChain(params.commitmentId, loggingContext);
-
-    if (commitment.status === "SETTLED") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message:
-          "Commitment has already been settled and cannot be exited early.",
         status: 409,
       });
     }
@@ -1207,10 +1250,6 @@ export async function earlyExitCommitmentOnChain(
       throw new BackendError({
         code: "CONFLICT",
         message: "Commitment is already in dispute.",
-    if (commitment.status === "EARLY_EXIT") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message: "Commitment has already been exited early.",
         status: 409,
       });
     }
@@ -1255,6 +1294,94 @@ export async function earlyExitCommitmentOnChain(
   }
 }
 
+export async function earlyExitCommitmentOnChain(
+  params: EarlyExitCommitmentOnChainParams,
+  loggingContext?: LoggingContext,
+): Promise<EarlyExitCommitmentOnChainResult> {
+  try {
+    if (!params.commitmentId) {
+      throw new BackendError({
+        code: "BAD_REQUEST",
+        message: "Missing commitment id for early exit.",
+        status: 400,
+      });
+    }
+
+    const commitment = await getCommitmentFromChain(
+      params.commitmentId,
+      loggingContext,
+    );
+
+    if (commitment.status === "SETTLED") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message:
+          "Commitment has already been settled and cannot be exited early.",
+        status: 409,
+      });
+    }
+
+    if (commitment.status === "DISPUTED") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message: "Commitment is already in dispute.",
+        status: 409,
+      });
+    }
+
+    if (commitment.status === "VIOLATED") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message: "Commitment has been violated and cannot be exited early.",
+        status: 409,
+      });
+    }
+
+    if (commitment.status === "EARLY_EXIT") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message: "Commitment has already been exited early.",
+        status: 409,
+      });
+    }
+
+    const invocation = await invokeContractMethod(
+      getContractId("commitmentCore"),
+      "early_exit_commitment",
+      [params.commitmentId, params.callerAddress ?? commitment.ownerAddress],
+      "write",
+    );
+
+    const result = asRecord(invocation.value);
+    const exitAmount = asString(result.exitAmount, "0");
+    const penaltyAmount = asString(result.penaltyAmount, "0");
+    const finalStatus = asString(result.finalStatus, "EARLY_EXIT");
+
+    await cache.delete(CacheKey.commitment(params.commitmentId));
+    if (commitment.ownerAddress) {
+      await cache.delete(CacheKey.userCommitments(commitment.ownerAddress));
+    }
+
+    return {
+      exitAmount,
+      penaltyAmount,
+      finalStatus,
+      txHash: invocation.txHash,
+      reference: invocation.txHash ? undefined : "TODO_CHAIN_CALL_EARLY_EXIT",
+    };
+  } catch (error) {
+    throw normalizeContractError(error, {
+      code: "BLOCKCHAIN_CALL_FAILED",
+      message: "Unable to exit commitment early on chain.",
+      status: 502,
+      details: {
+        method: "early_exit_commitment",
+        commitmentId: params.commitmentId,
+      },
+    });
+  }
+}
+
 export async function resolveDisputeOnChain(
   params: ResolveDisputeOnChainParams,
 ): Promise<ResolveDisputeOnChainResult> {
@@ -1273,10 +1400,6 @@ export async function resolveDisputeOnChain(
       throw new BackendError({
         code: "CONFLICT",
         message: "Can only resolve a commitment that is currently in dispute.",
-    if (commitment.status === "VIOLATED") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message: "Commitment has been violated and cannot be exited early.",
         status: 409,
       });
     }
@@ -1284,9 +1407,12 @@ export async function resolveDisputeOnChain(
     const invocation = await invokeContractMethod(
       getContractId("commitmentCore"),
       "resolve_dispute",
-      [params.commitmentId, params.resolution, params.notes ?? ""],
-      "early_exit_commitment",
-      [params.commitmentId, params.callerAddress ?? commitment.ownerAddress],
+      [
+        params.commitmentId,
+        params.resolution,
+        params.notes ?? "",
+        params.resolverAddress,
+      ],
       "write",
     );
 
@@ -1310,17 +1436,6 @@ export async function resolveDisputeOnChain(
       finalStatus,
       txHash: invocation.txHash,
       resolvedAt: new Date().toISOString(),
-    const exitAmount = asString(result.exitAmount, "0");
-    const penaltyAmount = asString(result.penaltyAmount, "0");
-    const finalStatus = asString(result.finalStatus, "EARLY_EXIT");
-
-    return {
-      exitAmount,
-      penaltyAmount,
-      finalStatus,
-      txHash: invocation.txHash,
-      contractVersion: invocation.version,
-      reference: invocation.txHash ? undefined : `TODO_CHAIN_CALL_EARLY_EXIT`,
     };
   } catch (error) {
     throw normalizeContractError(error, {
@@ -1329,10 +1444,6 @@ export async function resolveDisputeOnChain(
       status: 502,
       details: {
         method: "resolve_dispute",
-      message: "Unable to exit commitment early on chain.",
-      status: 502,
-      details: {
-        method: "early_exit_commitment",
         commitmentId: params.commitmentId,
       },
     });

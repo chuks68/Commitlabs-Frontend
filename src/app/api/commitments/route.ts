@@ -7,7 +7,7 @@ import { getClientIp } from '@/lib/backend/getClientIp';
 import { parseJsonWithLimit, JSON_BODY_LIMITS } from "@/lib/backend/jsonBodyLimit";
 import { checkRateLimit, getRateLimitWindowSeconds } from "@/lib/backend/rateLimit";
 import { getUserCommitmentsFromChain, createCommitmentOnChain } from "@/lib/backend/services/contracts";
-import { validateStellarAddress, validateSupportedAsset } from "@/lib/backend/validation";
+import { validateSupportedAsset } from "@/lib/backend/validation";
 import { withApiHandler } from "@/lib/backend/withApiHandler";
 
 const CommitmentsQuerySchema = z.object({
@@ -100,11 +100,6 @@ export const POST = withApiHandler(async (req: NextRequest, _context, correlatio
 
   if (!ownerAddress || typeof ownerAddress !== "string") {
     return fail("BAD_REQUEST", "Invalid ownerAddress", undefined, 400, correlationId);
-  }
-  try {
-    validateStellarAddress(ownerAddress, "ownerAddress");
-  } catch {
-    throw new ValidationError("Invalid ownerAddress: must be a valid Stellar address (G... format).");
   }
   if (!asset || typeof asset !== "string") {
     return fail("BAD_REQUEST", "Invalid asset", undefined, 400, correlationId);

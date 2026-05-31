@@ -39,7 +39,8 @@ export function getAuditLog(commitmentId: string): AuditLogEntry[] {
 }
 
 export function clearAuditLog(): void {
-    auditLogStore.length = 0;
+  auditLogStore.length = 0;
+}
 /**
  * Audit Event Store
  *

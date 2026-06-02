@@ -18,7 +18,8 @@
 //! `fund_escrow`, `release`, `refund`, and `dispute`.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, Map,
+    String, Symbol, Val, Vec,
 };
 
 // Configuration constants for escrow contract
@@ -65,6 +66,8 @@ pub enum DataKey {
     Attestations(u64),
     /// Configurable penalty-free grace period before maturity, in seconds.
     GracePeriodSeconds,
+    /// Score threshold below which a funded commitment is auto-violated.
+    ViolationThreshold,
 }
 
 /// Risk profile chosen at creation time. Determines the early-exit penalty
@@ -184,6 +187,8 @@ pub enum Error {
     InvalidWasmHash = 13,
     /// Commitment is in Violated status; release and refund are blocked until resolved.
     CommitmentViolated = 14,
+    /// Owner does not have enough tokens to fund the escrow.
+    InsufficientBalance = 15,
 }
 
 /// Result of an early exit commitment.
@@ -194,6 +199,66 @@ pub struct EarlyExitResult {
     pub exitAmount: i128,
     pub penaltyAmount: i128,
     pub finalStatus: EscrowStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateCommitmentEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub risk: RiskProfile,
+    pub maturity: u64,
+    pub penalty_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FundEscrowEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub risk: RiskProfile,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub accrued_yield: i128,
+    pub payout: i128,
+    pub risk: RiskProfile,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub refunded_amount: i128,
+    pub penalty: i128,
+    pub risk: RiskProfile,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub risk: RiskProfile,
+    pub reason_category: DisputeReason,
+    pub reason_text: String,
+    pub disputed_by: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolveDisputeEventData {
+    pub asset: Address,
+    pub amount: i128,
+    pub payout: i128,
+    pub penalty: i128,
+    pub risk: RiskProfile,
+    pub release_to_owner: bool,
 }
 
 
@@ -262,6 +327,15 @@ impl EscrowContract {
     }
 
     /// Pause contract writes. Admin only.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// No state transition; sets the paused flag to `true`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn pause(env: Env) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -277,6 +351,15 @@ impl EscrowContract {
     }
 
     /// Resume contract writes after an emergency pause. Admin only.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// No state transition; sets the paused flag to `false`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn unpause(env: Env) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -292,6 +375,12 @@ impl EscrowContract {
     }
 
     /// Return whether the contract is currently paused.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// `true` if paused, `false` otherwise
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -341,69 +430,15 @@ impl EscrowContract {
 
         let id = Self::next_id(&env);
         let now = env.ledger().timestamp();
-        let maturity = now.checked_add((duration_days as u64).checked_mul(SECONDS_PER_DAY).ok_or(Error::InvalidDuration)?).ok_or(Error::InvalidDuration)?;
+        let maturity = now
+            .checked_add(
+                (duration_days as u64)
+                    .checked_mul(SECONDS_PER_DAY)
+                    .ok_or(Error::InvalidDuration)?,
+            )
+            .ok_or(Error::InvalidDuration)?;
+        let accrued_yield = Self::calculate_accrued_yield(amount, duration_days, risk)?;
 
-        let commitment = Commitment {
-            id,
-            owner: owner.clone(),
-            asset,
-            amount,
-            accrued_yield: 0,
-            risk,
-            status: EscrowStatus::Created,
-            maturity,
-            penalty_bps,
-            compliance_score: 100,
-            created_at: now,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Commitment(id), &commitment);
-        Self::index_owner(&env, &owner, id);
-
-        env.events().publish(
-            (Symbol::new(&env, "create_commitment"), owner),
-            (id, amount, maturity),
-        );
-        Ok(id)
-    }
-
-    /// Create a new (unfunded) commitment escrow using the default penalty for
-    /// the specified risk profile. Returns the new commitment id.
-    ///
-    /// This function inherits the penalty_bps from the risk profile defaults
-    /// configured at initialization time. If an explicit penalty override is
-    /// needed, use `create_commitment()` instead.
-    ///
-    /// `duration_days` is converted to an absolute maturity timestamp using the
-    /// current ledger time.
-    pub fn create_commitment_with_default_penalty(
-        env: Env,
-        owner: Address,
-        asset: Address,
-        amount: i128,
-        risk: RiskProfile,
-        duration_days: u32,
-    ) -> Result<u64, Error> {
-        Self::require_init(&env)?;
-        owner.require_auth();
-
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        if duration_days == 0 {
-            return Err(Error::InvalidDuration);
-        }
-
-        // Retrieve the default penalty for this risk profile.
-        let penalty_bps = Self::get_default_penalty_internal(&env, risk)?;
-
-        let id = Self::next_id(&env);
-        let now = env.ledger().timestamp();
-        let maturity = now + (duration_days as u64) * SECONDS_PER_DAY;
-
-        let accrued_yield = calculate_accrued_yield(amount, duration_days, risk);
         let commitment = Commitment {
             id,
             owner: owner.clone(),
@@ -424,15 +459,119 @@ impl EscrowContract {
             .set(&DataKey::Commitment(id), &commitment);
         Self::index_owner(&env, &owner, id);
 
-        env.events().publish(
-            (Symbol::new(&env, "create_commitment"), owner),
-            (id, amount, maturity),
+        Self::publish_commitment_event(
+            &env,
+            "create_commitment",
+            &commitment,
+            CreateCommitmentEventData {
+                asset: commitment.asset.clone(),
+                amount: commitment.amount,
+                risk: commitment.risk,
+                maturity: commitment.maturity,
+                penalty_bps: commitment.penalty_bps,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Create a new (unfunded) commitment escrow using the default penalty for
+    /// the specified risk profile. Returns the new commitment id.
+    ///
+    /// This function inherits the penalty_bps from the risk profile defaults
+    /// configured at initialization time. If an explicit penalty override is
+    /// needed, use `create_commitment()` instead.
+    ///
+    /// `duration_days` is converted to an absolute maturity timestamp using the
+    /// current ledger time.
+    pub fn create_commitment_with_default(
+        env: Env,
+        owner: Address,
+        asset: Address,
+        amount: i128,
+        risk: RiskProfile,
+        duration_days: u32,
+    ) -> Result<u64, Error> {
+        Self::require_init(&env)?;
+        Self::require_not_paused(&env)?;
+        owner.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if amount > MAX_AMOUNT {
+            return Err(Error::InvalidAmount);
+        }
+        if duration_days == 0 {
+            return Err(Error::InvalidDuration);
+        }
+        if duration_days > MAX_DURATION_DAYS {
+            return Err(Error::InvalidDuration);
+        }
+
+        // Retrieve the default penalty for this risk profile.
+        let penalty_bps = Self::get_default_penalty_internal(&env, risk)?;
+
+        let id = Self::next_id(&env);
+        let now = env.ledger().timestamp();
+        let maturity = now
+            .checked_add(
+                (duration_days as u64)
+                    .checked_mul(SECONDS_PER_DAY)
+                    .ok_or(Error::InvalidDuration)?,
+            )
+            .ok_or(Error::InvalidDuration)?;
+        let accrued_yield = Self::calculate_accrued_yield(amount, duration_days, risk)?;
+        let commitment = Commitment {
+            id,
+            owner: owner.clone(),
+            asset,
+            amount,
+            accrued_yield,
+            risk,
+            status: EscrowStatus::Created,
+            maturity,
+            penalty_bps,
+            compliance_score: 100,
+            created_at: now,
+            metadata: Map::new(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Commitment(id), &commitment);
+        Self::index_owner(&env, &owner, id);
+
+        Self::publish_commitment_event(
+            &env,
+            "create_commitment",
+            &commitment,
+            CreateCommitmentEventData {
+                asset: commitment.asset.clone(),
+                amount: commitment.amount,
+                risk: commitment.risk,
+                maturity: commitment.maturity,
+                penalty_bps: commitment.penalty_bps,
+            },
         );
         Ok(id)
     }
 
     /// Move tokens from the owner into the contract, transitioning the
     /// commitment from `Created` to `Funded`.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Created`
+    /// Transitions to: `EscrowStatus::Funded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Paused` — contract is paused
+    /// - `InvalidState` — commitment not in `Created` state
+    /// - `AssetMismatch` — commitment asset does not match configured token
+    /// - `InvalidAmount` — owner has insufficient balance
     pub fn fund_escrow(env: Env, commitment_id: u64) -> Result<(), Error> {
         Self::require_init(&env)?;
         Self::require_not_paused(&env)?;
@@ -466,15 +605,28 @@ impl EscrowContract {
         c.status = EscrowStatus::Funded;
         Self::save(&env, &c);
 
-        env.events().publish(
-            (Symbol::new(&env, "fund_escrow"), c.owner.clone()),
-            (commitment_id, c.amount),
+        Self::publish_commitment_event(
+            &env,
+            "fund_escrow",
+            &c,
+            FundEscrowEventData {
+                asset: c.asset.clone(),
+                amount: c.amount,
+                risk: c.risk,
+            },
         );
         Ok(())
     }
 
     /// Deposit yield tokens into the contract's dedicated yield pool.
     /// Only the admin may fund the pool used to pay matured commitment yield.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `InvalidAmount` — amount is ≤ 0
     pub fn deposit_yield_pool(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         Self::require_init(&env)?;
         admin.require_auth();
@@ -497,6 +649,12 @@ impl EscrowContract {
     }
 
     /// Read the current yield pool balance available to pay matured commitment yield.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The current yield pool balance in token units
     pub fn get_yield_pool_balance(env: Env) -> i128 {
         Self::yield_pool_balance(&env)
     }
@@ -504,14 +662,24 @@ impl EscrowContract {
     /// Release the escrowed funds back to the owner once the commitment has
     /// matured.
     ///
-    /// Authorization rationale:
-    /// - Post-maturity this call is permissionless: any actor (including a
-    ///   third party) may invoke `release` to move funds out of the contract.
-    /// - This design avoids liveness issues where the owner cannot trigger
-    ///   release (e.g. lost key) while still protecting funds against
-    ///   diversion. To prevent an invoker from capturing funds, the transfer
-    ///   ALWAYS targets the stored `owner` recorded on the `Commitment`.
-    ///   The invoker never receives the escrowed asset.
+    /// # Authorization
+    /// Permissionless; any caller may invoke post-maturity. Funds always transfer to the stored owner.
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Released`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `NotMatured` — ledger time < maturity timestamp
+    /// - `InsufficientYieldPool` — yield pool cannot cover accrued yield
+    ///
+    /// # Authorization Rationale
+    /// Post-maturity this call is permissionless to avoid liveness issues where the owner
+    /// cannot trigger release (e.g., lost key). The transfer ALWAYS targets the stored
+    /// `owner` recorded on the `Commitment`, preventing fund diversion.
     pub fn release(env: Env, commitment_id: u64) -> Result<i128, Error> {
         Self::require_init(&env)?;
         let mut c = Self::load(&env, commitment_id)?;
@@ -535,17 +703,16 @@ impl EscrowContract {
         }
 
         let total_payout = c.amount + c.accrued_yield;
-        let token = Self::token_client(&env);
-        let contract = env.current_contract_address();
-        token.transfer(&contract, &c.owner, &total_payout);
-
+        
+        // Effects: Update state before interactions to prevent reentrancy
         Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
         c.status = EscrowStatus::Released;
         Self::save(&env, &c);
 
-        // Interactions: External token transfers
+        // Interactions: External token transfer
         let token = Self::token_client(&env);
-        token.transfer(&env.current_contract_address(), &c.owner, &c.amount);
+        let contract = env.current_contract_address();
+        token.transfer(&contract, &c.owner, &total_payout);
 
         env.events().publish(
             (Symbol::new(&env, "release"), c.owner.clone()),
@@ -557,6 +724,18 @@ impl EscrowContract {
     /// Early-exit refund. Returns the principal minus the early-exit penalty;
     /// the penalty is sent to the fee recipient. Only the owner may refund and
     /// only while the commitment is `Funded` and before maturity.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Refunded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn refund(env: Env, commitment_id: u64) -> Result<i128, Error> {
         Self::require_init(&env)?;
         let c = Self::load(&env, commitment_id)?;
@@ -573,9 +752,23 @@ impl EscrowContract {
     /// Only the owner may call this and only while the commitment is `Funded`. The
     /// call is rejected if the commitment is in `Violated` status.
     ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Funded` (if partial) or `EscrowStatus::Refunded` (if full)
+    ///
     /// # Arguments
     /// * `commitment_id` - The id of the target commitment.
     /// * `amount` - The portion of the principal to withdraw (must be > 0 and ≤ stored amount).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Paused` — contract is paused
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `InvalidAmount` — amount is ≤ 0 or > stored principal
     pub fn refund_partial(
         env: Env,
         commitment_id: u64,
@@ -599,7 +792,7 @@ impl EscrowContract {
         // Basis points represent a fraction out of 10_000. The penalty is the
         // floor of `amount * penalty_bps / 10_000`, so refund + penalty always
         // partitions the original principal while staying within checked math.
-        let (penalty, refund_amount) = Self::compute_refund_amount(c.amount, c.penalty_bps)?;
+        let (penalty, refund_amount) = Self::compute_refund_amount(amount, c.penalty_bps)?;
 
         // Update the stored principal; remainder stays in escrow.
         let remaining = c
@@ -637,6 +830,19 @@ impl EscrowContract {
     /// Process an early exit for a commitment. Only the owner (caller) may early exit
     /// and only while the commitment is `Funded`. Returns the structured result including
     /// exit amount, penalty amount, and updated status.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded`
+    /// Transitions to: `EscrowStatus::Refunded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Unauthorized` — caller is not the commitment owner
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `CommitmentViolated` — commitment in violated state
     pub fn early_exit_commitment(
         env: Env,
         commitment_id: u64,
@@ -659,6 +865,18 @@ impl EscrowContract {
     /// Flag a funded commitment as disputed, freezing release/refund until an
     /// admin resolves it. Either the owner or the admin may open a dispute.
     /// The reason string is automatically categorized based on keywords.
+    ///
+    /// # Authorization
+    /// Only callable by: owner or admin
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded`
+    /// Transitions to: `EscrowStatus::Disputed`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Unauthorized` — caller is neither owner nor admin
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn dispute(env: Env, commitment_id: u64, caller: Address, reason: String) -> Result<(), Error> {
         Self::require_init(&env)?;
         caller.require_auth();
@@ -695,15 +913,36 @@ impl EscrowContract {
             .persistent()
             .set(&DataKey::Dispute(commitment_id), &dispute_record);
 
-        env.events().publish(
-            (Symbol::new(&env, "dispute"), caller),
-            (commitment_id, reason_category as u32, reason),
+        Self::publish_commitment_event(
+            &env,
+            "dispute",
+            &c,
+            DisputeEventData {
+                asset: c.asset.clone(),
+                amount: c.amount,
+                risk: c.risk,
+                reason_category,
+                reason_text: reason,
+                disputed_by: caller,
+            },
         );
         Ok(())
     }
 
     /// Admin-only resolution of a dispute. `release_to_owner = true` pays the
     /// owner the full principal; `false` refunds principal minus penalty.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Disputed` or `EscrowStatus::Violated`
+    /// Transitions to: `EscrowStatus::Released` (if release_to_owner=true) or `EscrowStatus::Refunded` (if false)
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `InvalidState` — commitment not in `Disputed` or `Violated` state
+    /// - `InsufficientYieldPool` — yield pool cannot cover accrued yield (if releasing post-maturity)
     pub fn resolve_dispute(
         env: Env,
         commitment_id: u64,
@@ -718,12 +957,13 @@ impl EscrowContract {
         admin.require_auth();
 
         let mut c = Self::load(&env, commitment_id)?;
-        if c.status != EscrowStatus::Disputed {
+        if c.status != EscrowStatus::Disputed && c.status != EscrowStatus::Violated {
             return Err(Error::InvalidState);
         }
 
+        let token = Self::token_client(&env);
+        let contract = env.current_contract_address();
         let paid;
-        let penalty;
 
         if release_to_owner {
             let mut payout = c.amount;
@@ -735,33 +975,33 @@ impl EscrowContract {
                 payout += c.accrued_yield;
                 Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
             }
-            token.transfer(&contract, &c.owner, &payout);
             c.status = EscrowStatus::Released;
             paid = payout;
+            
+            // Effects: Update state before interactions to prevent reentrancy
+            Self::save(&env, &c);
+            
+            // Interactions: External token transfer
+            token.transfer(&contract, &c.owner, &payout);
         } else {
+            let (penalty, refund_amount) = Self::compute_refund_amount(c.amount, c.penalty_bps)?;
             c.status = EscrowStatus::Refunded;
-            penalty = (c.amount * c.penalty_bps as i128) / MAX_PENALTY_BPS as i128;
-            paid = c.amount - penalty;
-        }
-
-        // Effects: Update state before interactions to prevent reentrancy
-        Self::save(&env, &c);
-
-        // Interactions: External token transfers
-        let token = Self::token_client(&env);
-        let contract = env.current_contract_address();
-        let paid;
-        if release_to_owner {
-            token.transfer(&contract, &c.owner, &c.amount);
-            c.status = EscrowStatus::Released;
-            paid = c.amount;
-        } else {
-            let (_, refund_amount) = Self::compute_refund_amount(c.amount, c.penalty_bps)?;
             paid = refund_amount;
-            token.transfer(&contract, &c.owner, &paid);
-            c.status = EscrowStatus::Refunded;
+            
+            // Effects: Update state before interactions to prevent reentrancy
+            Self::save(&env, &c);
+            
+            // Interactions: transfer penalty then refund
+            if penalty > 0 {
+                let fee_recipient: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::FeeRecipient)
+                    .ok_or(Error::NotInitialized)?;
+                token.transfer(&contract, &fee_recipient, &penalty);
+            }
+            token.transfer(&contract, &c.owner, &refund_amount);
         }
-        token.transfer(&contract, &c.owner, &paid);
 
         env.events().publish(
             (Symbol::new(&env, "resolve_dispute"), admin),
@@ -830,8 +1070,14 @@ impl EscrowContract {
     ///
     /// Admin only. A threshold of 0 disables auto-violation.
     ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
     /// # Arguments
     /// * `threshold` - Score threshold 0..=100 (0 = disabled, 60 = violate below 60).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn set_violation_threshold(env: Env, threshold: u32) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -852,6 +1098,12 @@ impl EscrowContract {
     /// Return the current violation threshold (0..=100). A compliance score
     /// strictly below this value triggers auto-violation on attestation.
     /// Returns 0 if no threshold has been configured (auto-violation disabled).
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The current violation threshold (0..=100)
     pub fn get_violation_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -861,6 +1113,16 @@ impl EscrowContract {
 
     /// Record a compliance attestation (0..=100) against a commitment. Mirrors
     /// the attestation engine integration used by the backend.
+    ///
+    /// # Authorization
+    /// Only callable by: attestor (any address that authorizes)
+    ///
+    /// # State Transition
+    /// May transition `Funded` → `Violated` if score < violation threshold
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `NotFound` — commitment id does not exist
     pub fn record_attestation(
         env: Env,
         commitment_id: u64,
@@ -913,6 +1175,12 @@ impl EscrowContract {
     }
 
     /// Read a single commitment record.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotFound` — commitment id does not exist
     pub fn get_commitment(env: Env, commitment_id: u64) -> Result<Commitment, Error> {
         Self::load(&env, commitment_id)
     }
@@ -922,13 +1190,21 @@ impl EscrowContract {
     /// Preconditions:
     /// - Commitment must be in `Funded` state.
     ///
-    /// Authorization:
-    /// - Current commitment owner must authorize via `require_auth()`.
+    /// # Authorization
+    /// Only callable by: current owner
     ///
-    /// Effects:
+    /// # State Transition
+    /// No state change; updates `Commitment.owner` while remaining `Funded`
+    ///
+    /// # Effects
     /// - Updates `Commitment.owner`.
     /// - Maintains `OwnerIndex` for both the old owner and the new owner.
     /// - Emits `transfer_ownership`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `NotFound` — commitment id does not exist
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn transfer_ownership(env: Env, commitment_id: u64, new_owner: Address) -> Result<(), Error> {
         Self::require_init(&env)?;
 
@@ -962,7 +1238,15 @@ impl EscrowContract {
         );
 
         Ok(())
+    }
+
     /// Return the list of attestation history for a commitment id.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// A vector of `AttestationRecord` structures in chronological order
     pub fn get_attestations(env: Env, commitment_id: u64) -> Vec<AttestationRecord> {
         env.storage()
             .persistent()
@@ -971,6 +1255,12 @@ impl EscrowContract {
     }
 
     /// Return the list of commitment ids owned by an address.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// A vector of commitment ids owned by the address
     pub fn get_owner_commitments(env: Env, owner: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -980,6 +1270,12 @@ impl EscrowContract {
 
     /// Retrieve the dispute record for a commitment. Returns `None` if no
     /// dispute has been recorded.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The `DisputeRecord` if a dispute exists, `None` otherwise
     pub fn get_dispute(env: Env, commitment_id: u64) -> Option<DisputeRecord> {
         env.storage()
             .persistent()
@@ -988,8 +1284,17 @@ impl EscrowContract {
 
     /// Retrieve the default penalty (in basis points) for a specific risk profile.
     /// Configured at initialization time and used by
-    /// `create_commitment_with_default_penalty()`. Useful for querying the
+    /// `create_commitment_with_default()`. Useful for querying the
     /// current penalty configuration.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    ///
+    /// # Returns
+    /// The default penalty in basis points for the risk profile
     pub fn get_default_penalty(env: Env, risk: RiskProfile) -> Result<u32, Error> {
         env.storage()
             .instance()
@@ -1000,6 +1305,12 @@ impl EscrowContract {
     /// Admin-only setter for the penalty-free grace period before maturity.
     /// If the commitment is refunded within the configured window before
     /// maturity, the early-exit penalty is waived.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn set_grace_period(env: Env, admin: Address, grace_period_seconds: u64) -> Result<(), Error> {
         Self::require_init(&env)?;
         admin.require_auth();
@@ -1012,6 +1323,15 @@ impl EscrowContract {
     }
 
     /// Returns the currently configured penalty-free grace period in seconds.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    ///
+    /// # Returns
+    /// The grace period in seconds (0 if not configured)
     pub fn get_grace_period(env: Env) -> Result<u64, Error> {
         Self::require_init(&env)?;
         Ok(Self::grace_period_seconds(&env))
@@ -1059,9 +1379,17 @@ impl EscrowContract {
         c.status = EscrowStatus::Refunded;
         Self::save(env, &c);
 
-        env.events().publish(
-            (Symbol::new(env, "refund"), c.owner.clone()),
-            (c.id, refund_amount, penalty),
+        Self::publish_commitment_event(
+            env,
+            "refund",
+            &c,
+            RefundEventData {
+                asset: c.asset.clone(),
+                amount: c.amount,
+                refunded_amount: refund_amount,
+                penalty,
+                risk: c.risk,
+            },
         );
         Ok((refund_amount, penalty))
     }
@@ -1093,6 +1421,49 @@ impl EscrowContract {
         let refund_amount = amount.checked_sub(penalty).ok_or(Error::InvalidAmount)?;
 
         Ok((penalty, refund_amount))
+    }
+
+    fn get_default_penalty_internal(env: &Env, risk: RiskProfile) -> Result<u32, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DefaultPenalty(risk))
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn calculate_accrued_yield(
+        amount: i128,
+        duration_days: u32,
+        risk: RiskProfile,
+    ) -> Result<i128, Error> {
+        let annual_bps = match risk {
+            RiskProfile::Safe => 500,
+            RiskProfile::Balanced => 700,
+            RiskProfile::Aggressive => 1_000,
+        } as i128;
+
+        amount
+            .checked_mul(annual_bps)
+            .and_then(|value| value.checked_mul(duration_days as i128))
+            .map(|value| value / (365 * MAX_PENALTY_BPS as i128))
+            .ok_or(Error::InvalidAmount)
+    }
+
+    // Keep lifecycle event topic positions stable for the off-chain indexer:
+    // `(event_name, owner, commitment_id)`.
+    fn publish_commitment_event<D: IntoVal<Env, Val>>(
+        env: &Env,
+        event_name: &str,
+        commitment: &Commitment,
+        data: D,
+    ) {
+        env.events().publish(
+            (
+                Symbol::new(env, event_name),
+                commitment.owner.clone(),
+                commitment.id,
+            ),
+            data,
+        );
     }
 
     fn grace_period_seconds(env: &Env) -> u64 {
@@ -1156,7 +1527,7 @@ impl EscrowContract {
 
     /// Remove `id` from `owner`'s OwnerIndex list.
     fn deindex_owner(env: &Env, owner: &Address, id: u64) {
-        let mut ids: Vec<u64> = env
+        let ids: Vec<u64> = env
             .storage()
             .persistent()
             .get(&DataKey::OwnerIndex(owner.clone()))
@@ -1189,7 +1560,7 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::YieldPool, &amount);
     }
 
-    fn token_client(env: &Env) -> soroban_sdk::token::Client {
+    fn token_client(env: &Env) -> soroban_sdk::token::Client<'_> {
         let token: Address = env
             .storage()
             .instance()
@@ -1201,23 +1572,66 @@ impl EscrowContract {
     /// Categorize a free-form dispute reason string into a DisputeReason enum.
     /// Uses keyword matching to detect common dispute categories.
     fn categorize_dispute_reason(reason: &String) -> DisputeReason {
-        let reason_lower = reason.to_lowercase();
-        
-        // Check for keywords in order of specificity.
-        if reason_lower.contains("value") || reason_lower.contains("mismatch") 
-            || reason_lower.contains("amount") || reason_lower.contains("delivered") {
+        if Self::string_contains_ignore_case(reason, b"value")
+            || Self::string_contains_ignore_case(reason, b"mismatch")
+            || Self::string_contains_ignore_case(reason, b"amount")
+            || Self::string_contains_ignore_case(reason, b"delivered")
+        {
             DisputeReason::ValueMismatch
-        } else if reason_lower.contains("compliance") || reason_lower.contains("attestation")
-            || reason_lower.contains("failed") || reason_lower.contains("violation") {
+        } else if Self::string_contains_ignore_case(reason, b"compliance")
+            || Self::string_contains_ignore_case(reason, b"attestation")
+            || Self::string_contains_ignore_case(reason, b"failed")
+            || Self::string_contains_ignore_case(reason, b"violation")
+        {
             DisputeReason::NonCompliance
-        } else if reason_lower.contains("fraud") || reason_lower.contains("unauthorized")
-            || reason_lower.contains("suspicious") || reason_lower.contains("suspicious") {
+        } else if Self::string_contains_ignore_case(reason, b"fraud")
+            || Self::string_contains_ignore_case(reason, b"unauthorized")
+            || Self::string_contains_ignore_case(reason, b"suspicious")
+        {
             DisputeReason::FraudSuspicion
-        } else if reason_lower.contains("operational") || reason_lower.contains("failure")
-            || reason_lower.contains("delivery") {
+        } else if Self::string_contains_ignore_case(reason, b"operational")
+            || Self::string_contains_ignore_case(reason, b"failure")
+            || Self::string_contains_ignore_case(reason, b"delivery")
+        {
             DisputeReason::OperationalFailure
         } else {
             DisputeReason::Other
+        }
+    }
+
+    fn string_contains_ignore_case(haystack: &String, needle: &[u8]) -> bool {
+        let bytes = haystack.to_bytes();
+        if needle.is_empty() || bytes.len() < needle.len() as u32 {
+            return false;
+        }
+
+        let mut start: u32 = 0;
+        while start + needle.len() as u32 <= bytes.len() {
+            let mut matched = true;
+            let mut offset: u32 = 0;
+            while offset < needle.len() as u32 {
+                let hay = bytes.get(start + offset).unwrap();
+                let pattern = needle[offset as usize];
+                if Self::ascii_lower(hay) != Self::ascii_lower(pattern) {
+                    matched = false;
+                    break;
+                }
+                offset += 1;
+            }
+            if matched {
+                return true;
+            }
+            start += 1;
+        }
+
+        false
+    }
+
+    fn ascii_lower(byte: u8) -> u8 {
+        if byte >= b'A' && byte <= b'Z' {
+            byte + 32
+        } else {
+            byte
         }
     }
 }

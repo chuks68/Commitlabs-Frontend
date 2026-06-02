@@ -327,6 +327,15 @@ impl EscrowContract {
     }
 
     /// Pause contract writes. Admin only.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// No state transition; sets the paused flag to `true`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn pause(env: Env) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -342,6 +351,15 @@ impl EscrowContract {
     }
 
     /// Resume contract writes after an emergency pause. Admin only.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// No state transition; sets the paused flag to `false`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn unpause(env: Env) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -357,6 +375,12 @@ impl EscrowContract {
     }
 
     /// Return whether the contract is currently paused.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// `true` if paused, `false` otherwise
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -534,6 +558,20 @@ impl EscrowContract {
 
     /// Move tokens from the owner into the contract, transitioning the
     /// commitment from `Created` to `Funded`.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Created`
+    /// Transitions to: `EscrowStatus::Funded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Paused` — contract is paused
+    /// - `InvalidState` — commitment not in `Created` state
+    /// - `AssetMismatch` — commitment asset does not match configured token
+    /// - `InvalidAmount` — owner has insufficient balance
     pub fn fund_escrow(env: Env, commitment_id: u64) -> Result<(), Error> {
         Self::require_init(&env)?;
         Self::require_not_paused(&env)?;
@@ -582,6 +620,13 @@ impl EscrowContract {
 
     /// Deposit yield tokens into the contract's dedicated yield pool.
     /// Only the admin may fund the pool used to pay matured commitment yield.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `InvalidAmount` — amount is ≤ 0
     pub fn deposit_yield_pool(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         Self::require_init(&env)?;
         admin.require_auth();
@@ -604,6 +649,12 @@ impl EscrowContract {
     }
 
     /// Read the current yield pool balance available to pay matured commitment yield.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The current yield pool balance in token units
     pub fn get_yield_pool_balance(env: Env) -> i128 {
         Self::yield_pool_balance(&env)
     }
@@ -611,14 +662,24 @@ impl EscrowContract {
     /// Release the escrowed funds back to the owner once the commitment has
     /// matured.
     ///
-    /// Authorization rationale:
-    /// - Post-maturity this call is permissionless: any actor (including a
-    ///   third party) may invoke `release` to move funds out of the contract.
-    /// - This design avoids liveness issues where the owner cannot trigger
-    ///   release (e.g. lost key) while still protecting funds against
-    ///   diversion. To prevent an invoker from capturing funds, the transfer
-    ///   ALWAYS targets the stored `owner` recorded on the `Commitment`.
-    ///   The invoker never receives the escrowed asset.
+    /// # Authorization
+    /// Permissionless; any caller may invoke post-maturity. Funds always transfer to the stored owner.
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Released`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `NotMatured` — ledger time < maturity timestamp
+    /// - `InsufficientYieldPool` — yield pool cannot cover accrued yield
+    ///
+    /// # Authorization Rationale
+    /// Post-maturity this call is permissionless to avoid liveness issues where the owner
+    /// cannot trigger release (e.g., lost key). The transfer ALWAYS targets the stored
+    /// `owner` recorded on the `Commitment`, preventing fund diversion.
     pub fn release(env: Env, commitment_id: u64) -> Result<i128, Error> {
         Self::require_init(&env)?;
         let mut c = Self::load(&env, commitment_id)?;
@@ -642,25 +703,20 @@ impl EscrowContract {
         }
 
         let total_payout = c.amount + c.accrued_yield;
-        let token = Self::token_client(&env);
-        let contract = env.current_contract_address();
-        token.transfer(&contract, &c.owner, &total_payout);
-
+        
+        // Effects: Update state before interactions to prevent reentrancy
         Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
         c.status = EscrowStatus::Released;
         Self::save(&env, &c);
 
-        Self::publish_commitment_event(
-            &env,
-            "release",
-            &c,
-            ReleaseEventData {
-                asset: c.asset.clone(),
-                amount: c.amount,
-                accrued_yield: c.accrued_yield,
-                payout: total_payout,
-                risk: c.risk,
-            },
+        // Interactions: External token transfer
+        let token = Self::token_client(&env);
+        let contract = env.current_contract_address();
+        token.transfer(&contract, &c.owner, &total_payout);
+
+        env.events().publish(
+            (Symbol::new(&env, "release"), c.owner.clone()),
+            (commitment_id, total_payout, c.accrued_yield),
         );
         Ok(total_payout)
     }
@@ -668,6 +724,18 @@ impl EscrowContract {
     /// Early-exit refund. Returns the principal minus the early-exit penalty;
     /// the penalty is sent to the fee recipient. Only the owner may refund and
     /// only while the commitment is `Funded` and before maturity.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Refunded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn refund(env: Env, commitment_id: u64) -> Result<i128, Error> {
         Self::require_init(&env)?;
         let c = Self::load(&env, commitment_id)?;
@@ -684,9 +752,23 @@ impl EscrowContract {
     /// Only the owner may call this and only while the commitment is `Funded`. The
     /// call is rejected if the commitment is in `Violated` status.
     ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded` (not `Violated`)
+    /// Transitions to: `EscrowStatus::Funded` (if partial) or `EscrowStatus::Refunded` (if full)
+    ///
     /// # Arguments
     /// * `commitment_id` - The id of the target commitment.
     /// * `amount` - The portion of the principal to withdraw (must be > 0 and ≤ stored amount).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Paused` — contract is paused
+    /// - `CommitmentViolated` — commitment in violated state
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `InvalidAmount` — amount is ≤ 0 or > stored principal
     pub fn refund_partial(
         env: Env,
         commitment_id: u64,
@@ -748,6 +830,19 @@ impl EscrowContract {
     /// Process an early exit for a commitment. Only the owner (caller) may early exit
     /// and only while the commitment is `Funded`. Returns the structured result including
     /// exit amount, penalty amount, and updated status.
+    ///
+    /// # Authorization
+    /// Only callable by: owner
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded`
+    /// Transitions to: `EscrowStatus::Refunded`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Unauthorized` — caller is not the commitment owner
+    /// - `InvalidState` — commitment not in `Funded` state
+    /// - `CommitmentViolated` — commitment in violated state
     pub fn early_exit_commitment(
         env: Env,
         commitment_id: u64,
@@ -770,6 +865,18 @@ impl EscrowContract {
     /// Flag a funded commitment as disputed, freezing release/refund until an
     /// admin resolves it. Either the owner or the admin may open a dispute.
     /// The reason string is automatically categorized based on keywords.
+    ///
+    /// # Authorization
+    /// Only callable by: owner or admin
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Funded`
+    /// Transitions to: `EscrowStatus::Disputed`
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `Unauthorized` — caller is neither owner nor admin
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn dispute(env: Env, commitment_id: u64, caller: Address, reason: String) -> Result<(), Error> {
         Self::require_init(&env)?;
         caller.require_auth();
@@ -824,6 +931,18 @@ impl EscrowContract {
 
     /// Admin-only resolution of a dispute. `release_to_owner = true` pays the
     /// owner the full principal; `false` refunds principal minus penalty.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # State Transition
+    /// Requires: `EscrowStatus::Disputed` or `EscrowStatus::Violated`
+    /// Transitions to: `EscrowStatus::Released` (if release_to_owner=true) or `EscrowStatus::Refunded` (if false)
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `InvalidState` — commitment not in `Disputed` or `Violated` state
+    /// - `InsufficientYieldPool` — yield pool cannot cover accrued yield (if releasing post-maturity)
     pub fn resolve_dispute(
         env: Env,
         commitment_id: u64,
@@ -838,14 +957,14 @@ impl EscrowContract {
         admin.require_auth();
 
         let mut c = Self::load(&env, commitment_id)?;
-        if c.status != EscrowStatus::Disputed {
+        if c.status != EscrowStatus::Disputed && c.status != EscrowStatus::Violated {
             return Err(Error::InvalidState);
         }
 
         let token = Self::token_client(&env);
         let contract = env.current_contract_address();
         let paid;
-        let penalty;
+
         if release_to_owner {
             let mut payout = c.amount;
             if env.ledger().timestamp() >= c.maturity {
@@ -856,41 +975,37 @@ impl EscrowContract {
                 payout += c.accrued_yield;
                 Self::set_yield_pool_balance(&env, yield_pool - c.accrued_yield);
             }
-            token.transfer(&contract, &c.owner, &payout);
             c.status = EscrowStatus::Released;
             paid = payout;
-            penalty = 0;
+            
+            // Effects: Update state before interactions to prevent reentrancy
+            Self::save(&env, &c);
+            
+            // Interactions: External token transfer
+            token.transfer(&contract, &c.owner, &payout);
         } else {
-            let fee_recipient: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeRecipient)
-                .ok_or(Error::NotInitialized)?;
-            let (computed_penalty, refund_amount) =
-                Self::compute_refund_amount(c.amount, c.penalty_bps)?;
-            if computed_penalty > 0 {
-                token.transfer(&contract, &fee_recipient, &computed_penalty);
+            let (penalty, refund_amount) = Self::compute_refund_amount(c.amount, c.penalty_bps)?;
+            c.status = EscrowStatus::Refunded;
+            paid = refund_amount;
+            
+            // Effects: Update state before interactions to prevent reentrancy
+            Self::save(&env, &c);
+            
+            // Interactions: transfer penalty then refund
+            if penalty > 0 {
+                let fee_recipient: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::FeeRecipient)
+                    .ok_or(Error::NotInitialized)?;
+                token.transfer(&contract, &fee_recipient, &penalty);
             }
             token.transfer(&contract, &c.owner, &refund_amount);
-            c.status = EscrowStatus::Refunded;
-            penalty = computed_penalty;
-            paid = refund_amount;
         }
 
-        Self::save(&env, &c);
-
-        Self::publish_commitment_event(
-            &env,
-            "resolve_dispute",
-            &c,
-            ResolveDisputeEventData {
-                asset: c.asset.clone(),
-                amount: c.amount,
-                payout: paid,
-                penalty,
-                risk: c.risk,
-                release_to_owner,
-            },
+        env.events().publish(
+            (Symbol::new(&env, "resolve_dispute"), admin),
+            (commitment_id, release_to_owner, paid),
         );
         Ok(paid)
     }
@@ -955,8 +1070,14 @@ impl EscrowContract {
     ///
     /// Admin only. A threshold of 0 disables auto-violation.
     ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
     /// # Arguments
     /// * `threshold` - Score threshold 0..=100 (0 = disabled, 60 = violate below 60).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn set_violation_threshold(env: Env, threshold: u32) -> Result<(), Error> {
         Self::require_init(&env)?;
         let admin: Address = env
@@ -977,6 +1098,12 @@ impl EscrowContract {
     /// Return the current violation threshold (0..=100). A compliance score
     /// strictly below this value triggers auto-violation on attestation.
     /// Returns 0 if no threshold has been configured (auto-violation disabled).
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The current violation threshold (0..=100)
     pub fn get_violation_threshold(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -986,6 +1113,16 @@ impl EscrowContract {
 
     /// Record a compliance attestation (0..=100) against a commitment. Mirrors
     /// the attestation engine integration used by the backend.
+    ///
+    /// # Authorization
+    /// Only callable by: attestor (any address that authorizes)
+    ///
+    /// # State Transition
+    /// May transition `Funded` → `Violated` if score < violation threshold
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `NotFound` — commitment id does not exist
     pub fn record_attestation(
         env: Env,
         commitment_id: u64,
@@ -1038,6 +1175,12 @@ impl EscrowContract {
     }
 
     /// Read a single commitment record.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotFound` — commitment id does not exist
     pub fn get_commitment(env: Env, commitment_id: u64) -> Result<Commitment, Error> {
         Self::load(&env, commitment_id)
     }
@@ -1047,13 +1190,21 @@ impl EscrowContract {
     /// Preconditions:
     /// - Commitment must be in `Funded` state.
     ///
-    /// Authorization:
-    /// - Current commitment owner must authorize via `require_auth()`.
+    /// # Authorization
+    /// Only callable by: current owner
     ///
-    /// Effects:
+    /// # State Transition
+    /// No state change; updates `Commitment.owner` while remaining `Funded`
+    ///
+    /// # Effects
     /// - Updates `Commitment.owner`.
     /// - Maintains `OwnerIndex` for both the old owner and the new owner.
     /// - Emits `transfer_ownership`.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    /// - `NotFound` — commitment id does not exist
+    /// - `InvalidState` — commitment not in `Funded` state
     pub fn transfer_ownership(env: Env, commitment_id: u64, new_owner: Address) -> Result<(), Error> {
         Self::require_init(&env)?;
 
@@ -1090,6 +1241,12 @@ impl EscrowContract {
     }
 
     /// Return the list of attestation history for a commitment id.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// A vector of `AttestationRecord` structures in chronological order
     pub fn get_attestations(env: Env, commitment_id: u64) -> Vec<AttestationRecord> {
         env.storage()
             .persistent()
@@ -1098,6 +1255,12 @@ impl EscrowContract {
     }
 
     /// Return the list of commitment ids owned by an address.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// A vector of commitment ids owned by the address
     pub fn get_owner_commitments(env: Env, owner: Address) -> Vec<u64> {
         env.storage()
             .persistent()
@@ -1107,6 +1270,12 @@ impl EscrowContract {
 
     /// Retrieve the dispute record for a commitment. Returns `None` if no
     /// dispute has been recorded.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Returns
+    /// The `DisputeRecord` if a dispute exists, `None` otherwise
     pub fn get_dispute(env: Env, commitment_id: u64) -> Option<DisputeRecord> {
         env.storage()
             .persistent()
@@ -1117,6 +1286,15 @@ impl EscrowContract {
     /// Configured at initialization time and used by
     /// `create_commitment_with_default()`. Useful for querying the
     /// current penalty configuration.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    ///
+    /// # Returns
+    /// The default penalty in basis points for the risk profile
     pub fn get_default_penalty(env: Env, risk: RiskProfile) -> Result<u32, Error> {
         env.storage()
             .instance()
@@ -1127,6 +1305,12 @@ impl EscrowContract {
     /// Admin-only setter for the penalty-free grace period before maturity.
     /// If the commitment is refunded within the configured window before
     /// maturity, the early-exit penalty is waived.
+    ///
+    /// # Authorization
+    /// Only callable by: admin
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
     pub fn set_grace_period(env: Env, admin: Address, grace_period_seconds: u64) -> Result<(), Error> {
         Self::require_init(&env)?;
         admin.require_auth();
@@ -1139,6 +1323,15 @@ impl EscrowContract {
     }
 
     /// Returns the currently configured penalty-free grace period in seconds.
+    ///
+    /// # Authorization
+    /// None; read-only operation
+    ///
+    /// # Errors
+    /// - `NotInitialized` — contract not initialized
+    ///
+    /// # Returns
+    /// The grace period in seconds (0 if not configured)
     pub fn get_grace_period(env: Env) -> Result<u64, Error> {
         Self::require_init(&env)?;
         Ok(Self::grace_period_seconds(&env))

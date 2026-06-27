@@ -5,9 +5,10 @@ const nextConfig = {
     if (isServer) {
       // ioredis is an optional production dependency — exclude it from the
       // bundle so webpack doesn't error when it isn't installed.
-      config.externals = Array.isArray(config.externals)
+      const arr = Array.isArray(config.externals)
         ? ['ioredis', ...config.externals]
         : ['ioredis'];
+      config.externals = arr;
     }
     return config;
   },

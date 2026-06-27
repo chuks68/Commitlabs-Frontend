@@ -7,6 +7,7 @@ import CreateCommitmentStepConfigure from "@/components/CreateCommitmentStepConf
 import CreateCommitmentStepReview from "@/components/CreateCommitmentStepReview";
 import CommitmentCreatedModal from "@/components/modals/Commitmentcreatedmodal";
 import { buildExplorerUrl, openExplorerUrl } from "@/utils/explorerLinks";
+import { useWallet } from "@/hooks/useWallet";
 
 type CommitmentType = "safe" | "balanced" | "aggressive";
 
@@ -22,6 +23,7 @@ function generateCommitmentId(): string {
 
 export default function CreateCommitment() {
   const router = useRouter();
+  const { address: ownerAddress } = useWallet();
   const [step, setStep] = useState(1);
   const [selectedType, setSelectedType] = useState<CommitmentType | null>(null);
   const [commitmentType, setCommitmentType] =
@@ -185,6 +187,7 @@ export default function CreateCommitment() {
           earlyExitPenalty={earlyExitPenalty}
           estimatedFees={estimatedFees}
           isValid={isStep2Valid}
+          ownerAddress={ownerAddress}
           onChangeAmount={setAmount}
           onChangeAsset={setAsset}
           onChangeDuration={setDurationDays}
